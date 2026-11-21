@@ -344,3 +344,320 @@ class TestPersistence:
             assert core.get_edition(conn, 1) is None
         finally:
             conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 原片复用与时段索引
+# ---------------------------------------------------------------------------
+
+CSV2 = """片段号,原片起毫秒,原片止毫秒
+D,00:00:02.000,00:00:06.000
+E,00:00:10.000,00:00:14.000
+"""
+
+
+def source_field(html):
+    match = re.search(r'name="source_id" value="(\d+)"', html)
+    return match.group(1) if match else None
+
+
+def upload_csv_only(client, csv=CSV2, **fields):
+    data = {"csv": (open_bytes(csv), "edit2.csv")}
+    data.update(fields)
+    return client.post("/upload", data=data, content_type="multipart/form-data")
+
+
+def table_count(db, table):
+    conn = core.connect(db)
+    try:
+        return conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()["c"]
+    finally:
+        conn.close()
+
+
+class TestSourceReuse:
+    def test_homepage_offers_reuse_with_shown_source(self, client):
+        upload(client)
+        html = client.get("/").data.decode()
+        assert "沿用当前原片" in html
+        assert source_field(html) is not None
+        # 首页原字幕总数照旧显示
+        assert "原字幕总数" in html
+        assert ">3<" in html
+
+    def test_csv_only_creates_draft_from_shown_source(self, client, app):
+        first_id = upload(client)
+        html = client.get("/").data.decode()
+        response = upload_csv_only(client, source_id=source_field(html))
+        assert response.status_code == 302
+        new_id = int(re.search(r"/draft/(\d+)", response.headers["Location"]).group(1))
+        assert new_id != first_id
+        page = client.get(f"/draft/{new_id}")
+        assert page.status_code == 200
+        body = page.data.decode()
+        # 按页面所示的原片取段：D/E 两段来自同一份原片
+        assert "第二句原话，比较长，" in body
+        assert "第三句原话。" in body
+        # 原片只登记了一份，索引共用
+        assert table_count(app.config["DATABASE"], "source") == 1
+        assert table_count(app.config["DATABASE"], "source_cue") == 3
+
+    def test_reuse_pinned_source_despite_later_upload(self, client, app):
+        upload(client)  # 窗口 A 打开首页时的原片
+        html = client.get("/").data.decode()
+        pinned = source_field(html)
+        assert pinned is not None
+        # 另一个窗口随后上传了别的原片
+        other = VTT.replace("第一句原话。", "另一期完全不同的原话。")
+        upload(client, vtt=other)
+        assert table_count(app.config["DATABASE"], "source") == 2
+        # 本窗口仍按页面所示的原片取段
+        response = upload_csv_only(client, source_id=pinned)
+        assert response.status_code == 302
+        new_id = int(re.search(r"/draft/(\d+)", response.headers["Location"]).group(1))
+        body = client.get(f"/draft/{new_id}").data.decode()
+        assert "第一句原话。" in body
+        assert "另一期完全不同的原话。" not in body
+
+    def test_reuse_without_field_uses_latest_source(self, client):
+        upload(client)
+        response = upload_csv_only(client)
+        assert response.status_code == 302
+
+    def test_same_vtt_uploaded_twice_shares_one_source(self, client, app):
+        upload(client)
+        upload(client)  # 同一份原片再次双文件上传
+        assert table_count(app.config["DATABASE"], "source") == 1
+        assert table_count(app.config["DATABASE"], "source_cue") == 3
+        assert table_count(app.config["DATABASE"], "draft") == 2
+
+    def test_failed_reuse_keeps_draft_and_source(self, client, app):
+        old_id = upload(client)
+        db = app.config["DATABASE"]
+        before = {t: table_count(db, t) for t in ("draft", "source", "source_cue")}
+        bad_csv = "片段号,原片起毫秒,原片止毫秒\nA,0,1000\nA,1000,2000\n"
+        response = upload_csv_only(client, csv=bad_csv, source_id="1")
+        assert response.status_code == 302  # 回到首页并提示失败
+        follow = client.get(response.headers["Location"])
+        assert "片段号重复" in follow.data.decode()
+        after = {t: table_count(db, t) for t in ("draft", "source", "source_cue")}
+        assert after == before
+        # 当前草稿照旧可打开
+        assert client.get(f"/draft/{old_id}").status_code == 200
+
+    def test_unknown_source_rejected(self, client, app):
+        upload(client)
+        response = upload_csv_only(client, source_id="999")
+        assert response.status_code == 302
+        follow = client.get(response.headers["Location"])
+        assert "已不可用" in follow.data.decode()
+        assert table_count(app.config["DATABASE"], "draft") == 1
+
+    def test_reuse_inherits_matching_decisions(self, client):
+        old_id = upload(client)
+        fill(client, old_id, lambda index: ("keep", f"校订{index}"))
+        html = client.get("/").data.decode()
+        # 同一剪辑表只交 CSV：剪口校订照旧沿用
+        response = upload_csv_only(client, csv=CSV, source_id=source_field(html))
+        new_id = int(re.search(r"/draft/(\d+)", response.headers["Location"]).group(1))
+        body = client.get(f"/draft/{new_id}").data.decode()
+        assert body.count("沿用上一版校订") == 3
+
+
+class TestLegacyVolume:
+    """已有 SQLite 卷：旧草稿照常编辑发布，旧原片首次复用时补建索引。"""
+
+    OLD_SCHEMA = """
+    CREATE TABLE project (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        lock_version INTEGER NOT NULL DEFAULT 0
+    );
+    INSERT INTO project (id, lock_version) VALUES (1, 0);
+    CREATE TABLE draft (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        revision INTEGER NOT NULL,
+        vtt_raw TEXT NOT NULL,
+        cuts_json TEXT NOT NULL,
+        vtt_filename TEXT NOT NULL DEFAULT '',
+        csv_filename TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        published_version INTEGER
+    );
+    CREATE TABLE decision (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        draft_id INTEGER NOT NULL REFERENCES draft(id) ON DELETE CASCADE,
+        signature TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('keep', 'delete')),
+        text TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL,
+        UNIQUE (draft_id, signature)
+    );
+    CREATE TABLE edition (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        version_no INTEGER NOT NULL UNIQUE,
+        vtt_sha256 TEXT NOT NULL,
+        published_at TEXT NOT NULL,
+        total_ms INTEGER NOT NULL,
+        cue_count INTEGER NOT NULL,
+        source_draft_id INTEGER,
+        vtt_blob BLOB NOT NULL
+    );
+    """
+
+    @pytest.fixture()
+    def legacy_db(self, tmp_path):
+        import json as _json
+        import sqlite3
+
+        db = str(tmp_path / "legacy.db")
+        conn = sqlite3.connect(db)
+        conn.executescript(self.OLD_SCHEMA)
+        cuts = core.parse_cuts_csv(CSV)
+        conn.execute(
+            """
+            INSERT INTO draft
+                (revision, vtt_raw, cuts_json, vtt_filename, csv_filename, created_at)
+            VALUES (1, ?, ?, 'old.vtt', 'old.csv', '2024-01-01T00:00:00Z')
+            """,
+            (VTT, _json.dumps([c.__dict__ for c in cuts], ensure_ascii=False)),
+        )
+        conn.execute("UPDATE project SET lock_version = 1 WHERE id = 1")
+        conn.commit()
+        conn.close()
+        return db
+
+    def legacy_client(self, db):
+        application = create_app(db)
+        application.config.update(TESTING=True)
+        return application.test_client()
+
+    def test_old_draft_editable_and_publishable(self, legacy_db):
+        client = self.legacy_client(legacy_db)
+        page, revision, html = draft_form(client, 1)
+        assert page.status_code == 200
+        assert "第一句原话。" in html
+        # 旧草稿照常保存并发布
+        response = fill(client, 1, lambda index: ("keep", f"保留{index}"), publish=True)
+        assert response.status_code == 302
+        assert "/editions/1" in response.headers["Location"]
+        body = client.get("/editions/1/download").data.decode()
+        assert "第一句原话。" in body
+
+    def test_homepage_shows_old_source_for_reuse(self, legacy_db):
+        client = self.legacy_client(legacy_db)
+        html = client.get("/").data.decode()
+        assert "沿用当前原片" in html
+        assert 'name="from_draft" value="1"' in html
+
+    def test_old_source_backfilled_on_first_reuse(self, legacy_db):
+        client = self.legacy_client(legacy_db)
+        response = upload_csv_only(client, from_draft="1")
+        assert response.status_code == 302
+        new_id = int(re.search(r"/draft/(\d+)", response.headers["Location"]).group(1))
+        body = client.get(f"/draft/{new_id}").data.decode()
+        assert "第二句原话，比较长，" in body
+        # 补建的索引与首次复用建稿一起生效
+        conn = core.connect(legacy_db)
+        try:
+            assert conn.execute("SELECT COUNT(*) FROM source").fetchone()[0] == 1
+            assert conn.execute("SELECT COUNT(*) FROM source_cue").fetchone()[0] == 3
+            old = core.load_draft(conn, 1)
+            assert old["source_id"] is None  # 旧草稿本身不动
+            new = core.load_draft(conn, new_id)
+            assert new["source_id"] is not None
+        finally:
+            conn.close()
+        # 再次复用走已建好的索引
+        html = client.get("/").data.decode()
+        assert source_field(html) is not None
+
+
+class TestIndexedFlow:
+    def test_indexed_flow_never_reparses_vtt(self, client, monkeypatch):
+        draft_id = upload(client)
+
+        def forbidden(*_args, **_kwargs):
+            raise AssertionError("索引建好后不应再解析原片全文")
+
+        monkeypatch.setattr(core, "parse_vtt", forbidden)
+        # 打开草稿、保存、发布、再建稿都只读索引
+        page, revision, html = draft_form(client, draft_id)
+        assert page.status_code == 200
+        response = fill(
+            client, draft_id, lambda index: ("keep", f"保留{index}"), publish=True
+        )
+        assert response.status_code == 302
+        response = upload_csv_only(client)
+        assert response.status_code == 302
+        assert client.get("/").status_code == 200
+
+    def test_source_reusable_after_restart(self, tmp_path):
+        db = str(tmp_path / "restart-reuse.db")
+        first = create_app(db)
+        first.config.update(TESTING=True)
+        client = first.test_client()
+        upload(client)
+        fill(client, 1, lambda index: ("delete", ""), publish=True)
+
+        second = create_app(db)  # 模拟重启
+        second.config.update(TESTING=True)
+        client2 = second.test_client()
+        html = client2.get("/").data.decode()
+        assert source_field(html) is not None
+        response = upload_csv_only(client2, source_id=source_field(html))
+        assert response.status_code == 302
+        new_id = int(re.search(r"/draft/(\d+)", response.headers["Location"]).group(1))
+        assert client2.get(f"/draft/{new_id}").status_code == 200
+        # 旧版仍按版号原样下载
+        again = client2.get("/editions/1/download")
+        assert again.status_code == 200
+        assert again.data.decode().startswith("WEBVTT")
+
+    def test_large_source_full_flow(self, client, app):
+        """2 万条原字幕 + 1000 行剪辑表：完整流程且结果正确。"""
+        cue_count, cut_count = 20_000, 1_000
+        lines = ["WEBVTT", ""]
+        for i in range(cue_count):
+            start = i * 3000 + 700  # 错位，让剪口切在字幕中间
+            lines.append(str(i + 1))
+            lines.append(
+                f"{core.format_timestamp(start)} --> {core.format_timestamp(start + 2500)}"
+            )
+            lines.append(f"第{i + 1}条原字幕")
+            lines.append("")
+        big_vtt = "\n".join(lines)
+        rows = ["片段号,原片起毫秒,原片止毫秒"]
+        for j in range(cut_count):
+            rows.append(f"F{j + 1:04d},{j * 60_000},{(j + 1) * 60_000}")
+        big_csv = "\n".join(rows)
+
+        response = client.post(
+            "/upload",
+            data={
+                "vtt": (open_bytes(big_vtt), "big.vtt"),
+                "csv": (open_bytes(big_csv), "big.csv"),
+            },
+            content_type="multipart/form-data",
+        )
+        assert response.status_code == 302
+        draft_id = int(re.search(r"/draft/(\d+)", response.headers["Location"]).group(1))
+
+        page, revision, html = draft_form(client, draft_id)
+        assert page.status_code == 200
+        fields = occurrence_fields(html)
+        # 999 个内部剪口两端各截断一次；最后一条字幕还越出末段终点
+        assert len(fields) == 2 * (cut_count - 1) + 1
+        data = {"revision": revision}
+        for index in fields:
+            data[f"status:{index}"] = "keep"
+            data[f"text:{index}"] = f"保留{index}"
+        response = client.post(f"/draft/{draft_id}/publish", data=data)
+        assert response.status_code == 302
+
+        body = client.get("/editions/1/download").data.decode()
+        parsed = core.parse_vtt(body)
+        # 出现总数 = 整条 + 剪口；每条输出字幕都在节选时间线内
+        assert len(parsed) == cue_count + (cut_count - 1)
+        assert parsed[-1].end_ms <= cut_count * 60_000
+        # 原字幕序号在草稿页照旧显示
+        assert "原字幕 #20000" in html or "原字幕 #19999" in html

@@ -22,6 +22,34 @@
   </form>
 </section>
 
+{% if source %}
+<section class="panel">
+  <h2>沿用当前原片试剪</h2>
+  <dl class="facts">
+    <div><dt>当前原片</dt><dd>{{ source.filename or '未命名.vtt' }}</dd></div>
+    {% if source.cue_count is not none %}
+    <div><dt>原字幕总数</dt><dd>{{ source.cue_count }}</dd></div>
+    {% endif %}
+  </dl>
+  {% if source.kind == 'draft' %}
+  <p class="hint">这份原片来自迁移前的旧草稿，首次复用时会自动补建时段索引。</p>
+  {% endif %}
+  <form method="post" action="{{ url_for('upload') }}" enctype="multipart/form-data" class="upload-form">
+    {% if source.kind == 'source' %}
+    <input type="hidden" name="source_id" value="{{ source.source_id }}">
+    {% else %}
+    <input type="hidden" name="from_draft" value="{{ source.from_draft_id }}">
+    {% endif %}
+    <label>
+      <span>剪辑 CSV</span>
+      <input type="file" name="csv" accept=".csv,text/csv" required>
+    </label>
+    <p class="hint">同一期访谈试剪新版本时，原片 WebVTT 只需传过一次；这里只交剪辑 CSV 即可建稿，本次按页面所示的这份原片取段。</p>
+    <button type="submit" class="primary">沿用原片建立草稿</button>
+  </form>
+</section>
+{% endif %}
+
 {% if draft %}
 <section class="panel">
   <h2>当前草稿</h2>

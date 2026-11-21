@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import bisect
 import csv
 import hashlib
 import io
@@ -39,6 +40,10 @@ class PublishBlocked(RuntimeError):
     def __init__(self, pending: list["Occurrence"]):
         super().__init__(f"还有 {len(pending)} 处剪口字幕未处理")
         self.pending = pending
+
+
+class SourceNotFound(LookupError):
+    """页面引用的原片不存在或已不可用。"""
 
 
 def parse_timestamp(value: str) -> int:
@@ -336,11 +341,8 @@ def make_signature(fragment_no: str, cue_text: str, ov_start: int, ov_end: int) 
     )
 
 
-def compute_occurrences(cuts: list[Cut], cues: list[Cue]) -> list[Fragment]:
-    """按剪辑表行序拼接，展开每一次出现并计算节选时码。
-
-    片段号在表内唯一，因此每个片段恰好出现一次；同一原片时段可被多个片段取用。
-    """
+def _build_fragments(cuts: list[Cut]) -> list[Fragment]:
+    """按剪辑表行序拼接，换算各片段的节选偏移（乱序或重复取段也按行序累计）。"""
     fragments: list[Fragment] = []
     offset = 0
     for order, cut in enumerate(cuts):
@@ -348,34 +350,107 @@ def compute_occurrences(cuts: list[Cut], cues: list[Cue]) -> list[Fragment]:
             Fragment(cut.fragment_no, order, cut.start_ms, cut.end_ms, offset)
         )
         offset += cut.end_ms - cut.start_ms
+    return fragments
 
+
+def _add_occurrence(fragment: Fragment, cue: Cue) -> None:
+    """字幕与片段时段相交（含从剪口前延续进来的）时，展开一次出现。"""
+    ov_start = max(cue.start_ms, fragment.start_ms)
+    ov_end = min(cue.end_ms, fragment.end_ms)
+    if ov_end <= ov_start:
+        return
+    cut_start = cue.start_ms < fragment.start_ms
+    cut_end = cue.end_ms > fragment.end_ms
+    fragment.occurrences.append(
+        Occurrence(
+            cue_index=cue.index,
+            fragment_no=fragment.fragment_no,
+            fragment_order=fragment.order,
+            ov_start=ov_start,
+            ov_end=ov_end,
+            out_start=fragment.offset_ms + (ov_start - fragment.start_ms),
+            out_end=fragment.offset_ms + (ov_end - fragment.start_ms),
+            cut_start=cut_start,
+            cut_end=cut_end,
+            text=cue.text,
+            kind=CUT if (cut_start or cut_end) else WHOLE,
+            signature=make_signature(
+                fragment.fragment_no, cue.text, ov_start, ov_end
+            ),
+        )
+    )
+
+
+def _max_cue_span(cues: Iterable[Cue]) -> int:
+    """原片里最长单条字幕时长：相交查询只需回看这么远。"""
+    return max((cue.end_ms - cue.start_ms for cue in cues), default=0)
+
+
+def compute_occurrences(cuts: list[Cut], cues: list[Cue]) -> list[Fragment]:
+    """按剪辑表行序拼接，展开每一次出现并计算节选时码。
+
+    片段号在表内唯一，因此每个片段恰好出现一次；同一原片时段可被多个片段取用。
+    查找按起时二分，不为每个选段遍历全部字幕。
+    """
+    fragments = _build_fragments(cuts)
     ordered_cues = sorted(cues, key=lambda cue: (cue.start_ms, cue.index))
+    starts = [cue.start_ms for cue in ordered_cues]
+    max_span = _max_cue_span(ordered_cues)
     for fragment in fragments:
-        for cue in ordered_cues:
-            ov_start = max(cue.start_ms, fragment.start_ms)
-            ov_end = min(cue.end_ms, fragment.end_ms)
-            if ov_end <= ov_start:
-                continue
-            cut_start = cue.start_ms < fragment.start_ms
-            cut_end = cue.end_ms > fragment.end_ms
-            fragment.occurrences.append(
-                Occurrence(
-                    cue_index=cue.index,
-                    fragment_no=fragment.fragment_no,
-                    fragment_order=fragment.order,
-                    ov_start=ov_start,
-                    ov_end=ov_end,
-                    out_start=fragment.offset_ms + (ov_start - fragment.start_ms),
-                    out_end=fragment.offset_ms + (ov_end - fragment.start_ms),
-                    cut_start=cut_start,
-                    cut_end=cut_end,
-                    text=cue.text,
-                    kind=CUT if (cut_start or cut_end) else WHOLE,
-                    signature=make_signature(
-                        fragment.fragment_no, cue.text, ov_start, ov_end
-                    ),
-                )
-            )
+        # 相交 ⇔ start < 片段止 且 end > 片段起；由 end-start ≤ max_span 得
+        # start > 片段起 - max_span，故只需在该窗口内查找。
+        lo = bisect.bisect_right(starts, fragment.start_ms - max_span)
+        hi = bisect.bisect_left(starts, fragment.end_ms)
+        for cue in ordered_cues[lo:hi]:
+            _add_occurrence(fragment, cue)
+    return fragments
+
+
+def _overlapping_cues(
+    conn: sqlite3.Connection,
+    source_id: int,
+    seg_start: int,
+    seg_end: int,
+    max_span: int,
+) -> list[Cue]:
+    """从原片时段索引中只取与选段相交的字幕（含剪口前开始、延续进来的）。"""
+    rows = conn.execute(
+        """
+        SELECT cue_index, start_ms, end_ms, text
+        FROM source_cue
+        WHERE source_id = ?
+          AND start_ms > ?
+          AND start_ms < ?
+          AND end_ms > ?
+        ORDER BY start_ms, cue_index
+        """,
+        (source_id, seg_start - max_span, seg_end, seg_start),
+    )
+    return [
+        Cue(
+            index=row["cue_index"],
+            identifier="",
+            start_ms=row["start_ms"],
+            end_ms=row["end_ms"],
+            text=row["text"],
+        )
+        for row in rows
+    ]
+
+
+def compute_occurrences_indexed(
+    conn: sqlite3.Connection,
+    source_id: int,
+    cuts: list[Cut],
+    max_span: int,
+) -> list[Fragment]:
+    """用原片的共用时段索引展开出现：每个选段只读取相交的字幕正文。"""
+    fragments = _build_fragments(cuts)
+    for fragment in fragments:
+        for cue in _overlapping_cues(
+            conn, source_id, fragment.start_ms, fragment.end_ms, max_span
+        ):
+            _add_occurrence(fragment, cue)
     return fragments
 
 
@@ -443,6 +518,27 @@ CREATE TABLE IF NOT EXISTS project (
 );
 INSERT OR IGNORE INTO project (id, lock_version) VALUES (1, 0);
 
+CREATE TABLE IF NOT EXISTS source (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sha256 TEXT NOT NULL UNIQUE,
+    vtt_raw TEXT NOT NULL,
+    filename TEXT NOT NULL DEFAULT '',
+    cue_count INTEGER NOT NULL,
+    max_cue_ms INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS source_cue (
+    source_id INTEGER NOT NULL REFERENCES source(id) ON DELETE CASCADE,
+    cue_index INTEGER NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    PRIMARY KEY (source_id, cue_index)
+);
+CREATE INDEX IF NOT EXISTS idx_source_cue_start
+    ON source_cue (source_id, start_ms, cue_index);
+
 CREATE TABLE IF NOT EXISTS draft (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     revision INTEGER NOT NULL,
@@ -451,7 +547,8 @@ CREATE TABLE IF NOT EXISTS draft (
     vtt_filename TEXT NOT NULL DEFAULT '',
     csv_filename TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
-    published_version INTEGER
+    published_version INTEGER,
+    source_id INTEGER REFERENCES source(id)
 );
 
 CREATE TABLE IF NOT EXISTS decision (
@@ -489,6 +586,14 @@ def init_db(path: str) -> None:
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
+        # 已有 SQLite 卷：补上草稿到原片的关联列，旧草稿内容不动。
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(draft)")
+        }
+        if "source_id" not in columns:
+            conn.execute(
+                "ALTER TABLE draft ADD COLUMN source_id INTEGER REFERENCES source(id)"
+            )
     finally:
         conn.close()
 
@@ -532,19 +637,93 @@ def _insert_decisions(
         )
 
 
+def _find_or_create_source(
+    conn: sqlite3.Connection, vtt_raw: str, cues: list[Cue], filename: str = ""
+) -> int:
+    """按内容哈希复用或登记原片；新原片同时建立时段索引（须在事务内调用）。"""
+    digest = hashlib.sha256(vtt_raw.encode("utf-8")).hexdigest()
+    row = conn.execute(
+        "SELECT id FROM source WHERE sha256 = ?", (digest,)
+    ).fetchone()
+    if row is not None:
+        return row["id"]
+    cursor = conn.execute(
+        """
+        INSERT INTO source (sha256, vtt_raw, filename, cue_count, max_cue_ms, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            digest,
+            vtt_raw,
+            filename,
+            len(cues),
+            _max_cue_span(cues),
+            _utc_now(),
+        ),
+    )
+    source_id = cursor.lastrowid
+    conn.executemany(
+        """
+        INSERT INTO source_cue (source_id, cue_index, start_ms, end_ms, text)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        [
+            (source_id, cue.index, cue.start_ms, cue.end_ms, cue.text)
+            for cue in cues
+        ],
+    )
+    return source_id
+
+
+def _source_row(conn: sqlite3.Connection, source_id: int) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM source WHERE id = ?", (source_id,)
+    ).fetchone()
+    if row is None:
+        raise SourceNotFound("页面所示的原片已不可用，请重新上传。")
+    return row
+
+
 def create_draft(
     conn: sqlite3.Connection,
-    vtt_raw: str,
     cuts: list[Cut],
-    cues: list[Cue],
     *,
+    source_id: Optional[int] = None,
+    from_draft_id: Optional[int] = None,
+    vtt_raw: Optional[str] = None,
+    cues: Optional[list[Cue]] = None,
     vtt_filename: str = "",
     csv_filename: str = "",
 ) -> int:
-    """建立新草稿：锁版本递增（旧草稿页随之过期），并沿用上一版可匹配的校订。"""
-    fragments = compute_occurrences(cuts, cues)
+    """建立新草稿：锁版本递增（旧草稿页随之过期），并沿用上一版可匹配的校订。
+
+    原片只需传一次：可传 source_id 沿用已登记的原片，或传 from_draft_id 沿用
+    旧草稿里的原片（首次复用时补建时段索引）。索引与首次建稿在同一事务生效；
+    任何失败都会回滚，当前草稿和可复用的原片照旧。
+    """
     conn.execute("BEGIN IMMEDIATE")
     try:
+        if source_id is None:
+            if vtt_raw is None and from_draft_id is not None:
+                old = load_draft(conn, from_draft_id)
+                if old is None:
+                    raise SourceNotFound("页面所示的原片已不可用，请重新上传。")
+                if old["source_id"] is not None:
+                    source_id = old["source_id"]
+                else:
+                    vtt_raw = old["vtt_raw"]
+                if not vtt_filename:
+                    vtt_filename = old["vtt_filename"]
+            if source_id is None:
+                if vtt_raw is None:
+                    raise SourceNotFound("缺少原片：请上传 WebVTT 或沿用页面所示的原片。")
+                if cues is None:
+                    cues = parse_vtt(vtt_raw)
+                source_id = _find_or_create_source(conn, vtt_raw, cues, vtt_filename)
+        source = _source_row(conn, source_id)
+        fragments = compute_occurrences_indexed(
+            conn, source_id, cuts, source["max_cue_ms"]
+        )
         previous = conn.execute(
             "SELECT id FROM draft ORDER BY id DESC LIMIT 1"
         ).fetchone()
@@ -556,16 +735,17 @@ def create_draft(
         cursor = conn.execute(
             """
             INSERT INTO draft
-                (revision, vtt_raw, cuts_json, vtt_filename, csv_filename, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (revision, vtt_raw, cuts_json, vtt_filename, csv_filename,
+                 created_at, source_id)
+            VALUES (?, '', ?, ?, ?, ?, ?)
             """,
             (
                 revision,
-                vtt_raw,
                 json.dumps([cut.__dict__ for cut in cuts], ensure_ascii=False),
-                vtt_filename,
+                vtt_filename or source["filename"],
                 csv_filename,
                 _utc_now(),
+                source_id,
             ),
         )
         draft_id = cursor.lastrowid
@@ -583,20 +763,36 @@ def load_draft(conn: sqlite3.Connection, draft_id: int) -> Optional[sqlite3.Row]
     return conn.execute("SELECT * FROM draft WHERE id = ?", (draft_id,)).fetchone()
 
 
+def _fragments_for_row(conn: sqlite3.Connection, row: sqlite3.Row) -> list[Fragment]:
+    """展开草稿的全部出现：有时段索引只读相交字幕，旧草稿按原片全文解析。"""
+    cuts = _parse_cuts(row["cuts_json"])
+    if row["source_id"] is not None:
+        source = _source_row(conn, row["source_id"])
+        return compute_occurrences_indexed(
+            conn, row["source_id"], cuts, source["max_cue_ms"]
+        )
+    return compute_occurrences(cuts, parse_vtt(row["vtt_raw"]))
+
+
+def _cue_count_for_row(conn: sqlite3.Connection, row: sqlite3.Row) -> int:
+    if row["source_id"] is not None:
+        return _source_row(conn, row["source_id"])["cue_count"]
+    return len(parse_vtt(row["vtt_raw"]))
+
+
 def load_bundle(conn: sqlite3.Connection, draft_id: int) -> Optional[dict]:
     row = load_draft(conn, draft_id)
     if row is None:
         return None
-    cues = parse_vtt(row["vtt_raw"])
     cuts = _parse_cuts(row["cuts_json"])
-    fragments = compute_occurrences(cuts, cues)
+    fragments = _fragments_for_row(conn, row)
     current_lock = lock_version(conn)
     return {
         "row": row,
-        "cues": cues,
         "cuts": cuts,
         "fragments": fragments,
         "occurrences": flatten(fragments),
+        "cue_count": _cue_count_for_row(conn, row),
         "decisions": decision_rows(conn, draft_id),
         "lock_version": current_lock,
         "stale": row["published_version"] is not None
@@ -628,9 +824,7 @@ def save_decisions(
     conn.execute("BEGIN IMMEDIATE")
     try:
         row = _reject_if_stale(conn, draft_id, expected_revision)
-        fragments = compute_occurrences(
-            _parse_cuts(row["cuts_json"]), parse_vtt(row["vtt_raw"])
-        )
+        fragments = _fragments_for_row(conn, row)
         valid = {occ.signature for occ in flatten(fragments) if occ.kind == CUT}
         now = _utc_now()
         for change in changes:
@@ -678,6 +872,35 @@ def active_draft(conn: sqlite3.Connection) -> Optional[sqlite3.Row]:
     return row
 
 
+def reusable_source(conn: sqlite3.Connection) -> Optional[dict]:
+    """首页「沿用原片」信息：最近一份草稿使用的原片。
+
+    新草稿直接给出 source_id；旧版草稿（迁移前建立）给出 from_draft_id，
+    首次复用时补建时段索引。
+    """
+    latest = conn.execute("SELECT * FROM draft ORDER BY id DESC LIMIT 1").fetchone()
+    if latest is None:
+        return None
+    if latest["source_id"] is not None:
+        source = conn.execute(
+            "SELECT * FROM source WHERE id = ?", (latest["source_id"],)
+        ).fetchone()
+        if source is None:
+            return None
+        return {
+            "kind": "source",
+            "source_id": source["id"],
+            "filename": latest["vtt_filename"] or source["filename"],
+            "cue_count": source["cue_count"],
+        }
+    return {
+        "kind": "draft",
+        "from_draft_id": latest["id"],
+        "filename": latest["vtt_filename"],
+        "cue_count": None,
+    }
+
+
 def list_editions(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return list(
         conn.execute(
@@ -698,9 +921,7 @@ def publish(conn: sqlite3.Connection, draft_id: int, expected_revision: int) -> 
     conn.execute("BEGIN IMMEDIATE")
     try:
         row = _reject_if_stale(conn, draft_id, expected_revision)
-        fragments = compute_occurrences(
-            _parse_cuts(row["cuts_json"]), parse_vtt(row["vtt_raw"])
-        )
+        fragments = _fragments_for_row(conn, row)
         decisions = decision_rows(conn, draft_id)
         pending = pending_occurrences(fragments, decisions)
         if pending:

@@ -55,7 +55,7 @@ def create_app(database_path: str | None = None) -> Flask:
                 "csv_filename": draft["csv_filename"],
                 "created_at": draft["created_at"],
                 "fragment_count": len(bundle["cuts"]),
-                "cue_count": len(bundle["cues"]),
+                "cue_count": bundle["cue_count"],
                 "occurrence_count": len(bundle["occurrences"]),
                 "cut_count": sum(
                     1 for occ in bundle["occurrences"] if occ.kind == core.CUT
@@ -66,23 +66,18 @@ def create_app(database_path: str | None = None) -> Flask:
                 "total_ms": sum(f.duration_ms for f in bundle["fragments"]),
             }
         return render_template(
-            "index.html", draft=draft_info, editions=core.list_editions(conn)
+            "index.html",
+            draft=draft_info,
+            source=core.reusable_source(conn),
+            editions=core.list_editions(conn),
         )
 
     @app.post("/upload")
     def upload():
         vtt_file = request.files.get("vtt")
         csv_file = request.files.get("csv")
-        if vtt_file is None or not vtt_file.filename:
-            flash("请选择单期原片的 WebVTT 文件。", "error")
-            return redirect(url_for("index"))
         if csv_file is None or not csv_file.filename:
             flash("请选择剪辑 CSV 文件。", "error")
-            return redirect(url_for("index"))
-        try:
-            vtt_raw = vtt_file.read().decode("utf-8-sig")
-        except UnicodeDecodeError:
-            flash("WebVTT 文件不是 UTF-8 编码。", "error")
             return redirect(url_for("index"))
         csv_bytes = csv_file.read()
         try:
@@ -94,23 +89,25 @@ def create_app(database_path: str | None = None) -> Flask:
             except UnicodeDecodeError:
                 flash("剪辑 CSV 不是 UTF-8 或 GB18030 编码。", "error")
                 return redirect(url_for("index"))
-
         try:
-            cues = core.parse_vtt(vtt_raw)
             cuts = core.parse_cuts_csv(csv_raw)
         except core.ParseError as exc:
             flash(f"上传失败：{exc}", "error")
             return redirect(url_for("index"))
 
+        csv_filename = secure_filename(csv_file.filename) or csv_file.filename
         conn = get_db()
-        draft_id = core.create_draft(
-            conn,
-            vtt_raw,
-            cuts,
-            cues,
-            vtt_filename=secure_filename(vtt_file.filename) or vtt_file.filename,
-            csv_filename=secure_filename(csv_file.filename) or csv_file.filename,
-        )
+        try:
+            if vtt_file is not None and vtt_file.filename:
+                draft_id = _upload_with_new_source(vtt_file, cuts, csv_filename)
+            else:
+                draft_id = _upload_reusing_source(conn, cuts, csv_filename)
+        except core.ParseError as exc:
+            flash(f"上传失败：{exc}", "error")
+            return redirect(url_for("index"))
+        except core.SourceNotFound as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("index"))
         flash("已建立草稿：剪辑表中每一次出现都已重新计算节选时码。", "ok")
         return redirect(url_for("draft_page", draft_id=draft_id))
 
@@ -216,6 +213,49 @@ def get_db():
     if "db" not in g:
         g.db = core.connect(current_app.config["DATABASE"])
     return g.db
+
+
+def _upload_with_new_source(vtt_file, cuts, csv_filename: str) -> int:
+    """双文件上传：登记（或按内容复用）原片并建稿。"""
+    try:
+        vtt_raw = vtt_file.read().decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise core.ParseError("WebVTT 文件不是 UTF-8 编码。") from None
+    cues = core.parse_vtt(vtt_raw)
+    return core.create_draft(
+        get_db(),
+        cuts,
+        vtt_raw=vtt_raw,
+        cues=cues,
+        vtt_filename=secure_filename(vtt_file.filename) or vtt_file.filename,
+        csv_filename=csv_filename,
+    )
+
+
+def _upload_reusing_source(conn, cuts, csv_filename: str) -> int:
+    """只交剪辑 CSV：按页面所示的原片建稿（隐藏字段锁定，不受他窗口影响）。"""
+    source_id = (request.form.get("source_id") or "").strip()
+    from_draft = (request.form.get("from_draft") or "").strip()
+    kwargs: dict = {"csv_filename": csv_filename}
+    try:
+        if source_id:
+            kwargs["source_id"] = int(source_id)
+        elif from_draft:
+            kwargs["from_draft_id"] = int(from_draft)
+        else:
+            # 未带页面字段时沿用当前可复用的原片。
+            current = core.reusable_source(conn)
+            if current is None:
+                raise core.SourceNotFound(
+                    "请选择单期原片的 WebVTT 文件，或沿用页面所示的原片。"
+                )
+            if current["kind"] == "source":
+                kwargs["source_id"] = current["source_id"]
+            else:
+                kwargs["from_draft_id"] = current["from_draft_id"]
+    except ValueError:
+        abort(400, "原片标识不合法")
+    return core.create_draft(conn, cuts, **kwargs)
 
 
 def close_db(_exc=None) -> None:

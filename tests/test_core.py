@@ -1,6 +1,9 @@
 """领域逻辑单元测试：时码、WebVTT、剪辑表、出现计算、校订继承。"""
 from __future__ import annotations
 
+import json
+import random
+
 import pytest
 
 from app import core
@@ -18,6 +21,17 @@ def cuts(spec):
         core.Cut(fragment_no=no, start_ms=s, end_ms=e, line_no=i + 2)
         for i, (no, s, e) in enumerate(spec)
     ]
+
+
+@pytest.fixture()
+def db_conn(tmp_path):
+    db = str(tmp_path / "core.db")
+    core.init_db(db)
+    conn = core.connect(db)
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 class TestTimestamps:
@@ -235,3 +249,193 @@ class TestInheritance:
         previous = {old_occ.signature: {"status": "keep", "text": "旧校订"}}
         assert core.inherited_decisions(new, previous) == {}
         assert new_occ.signature != old_occ.signature
+
+
+# ---------------------------------------------------------------------------
+# 原片时段索引
+# ---------------------------------------------------------------------------
+
+
+def random_cues(count: int, seed: int = 7) -> list[core.Cue]:
+    """生成确定性的伪随机字幕：时长 0.5–6s，间隔 0–2s。"""
+    rng = random.Random(seed)
+    out = []
+    pos = 0
+    for i in range(count):
+        duration = rng.randint(500, 6000)
+        gap = rng.randint(0, 2000)
+        out.append(
+            core.Cue(
+                index=i,
+                identifier="",
+                start_ms=pos,
+                end_ms=pos + duration,
+                text=f"字幕{i}",
+            )
+        )
+        pos += duration + gap
+    return out
+
+
+def random_cuts(count: int, horizon: int, seed: int = 13) -> list[core.Cut]:
+    """乱序且允许重复取段的剪辑表。"""
+    rng = random.Random(seed)
+    spec = []
+    for i in range(count):
+        start = rng.randint(0, horizon - 10_000)
+        end = start + rng.randint(1000, 10_000)
+        spec.append((f"F{i:04d}", start, end))
+    # 重复取用同一时段
+    spec.append(("DUP", spec[3][1], spec[3][2]))
+    return cuts(spec)
+
+
+class TestIndexedOccurrences:
+    def test_indexed_matches_in_memory(self, db_conn):
+        cue_list = random_cues(2000)
+        cut_list = random_cuts(120, cue_list[-1].end_ms)
+        source_id = core._find_or_create_source(db_conn, "WEBVTT\n\nx", cue_list, "x.vtt")
+        max_span = db_conn.execute(
+            "SELECT max_cue_ms FROM source WHERE id = ?", (source_id,)
+        ).fetchone()[0]
+        expected = core.flatten(core.compute_occurrences(cut_list, cue_list))
+        actual = core.flatten(
+            core.compute_occurrences_indexed(db_conn, source_id, cut_list, max_span)
+        )
+        keys = lambda occ: (
+            occ.cue_index,
+            occ.fragment_no,
+            occ.fragment_order,
+            occ.ov_start,
+            occ.ov_end,
+            occ.out_start,
+            occ.out_end,
+            occ.cut_start,
+            occ.cut_end,
+            occ.text,
+            occ.kind,
+            occ.signature,
+        )
+        assert [keys(o) for o in actual] == [keys(o) for o in expected]
+
+    def test_cue_straddling_cut_start_is_selected(self, db_conn):
+        cue_list = cues([(500, 1500, "从剪口前延续进来")])
+        source_id = core._find_or_create_source(db_conn, "WEBVTT\n\nx", cue_list)
+        frags = core.compute_occurrences_indexed(
+            db_conn, source_id, cuts([("A", 1000, 2000)]), max_span=1000
+        )
+        occ = core.flatten(frags)[0]
+        assert occ.text == "从剪口前延续进来"
+        assert occ.cut_start and not occ.cut_end
+        assert (occ.ov_start, occ.ov_end) == (1000, 1500)
+
+    def test_lookup_uses_index_not_full_scan(self, db_conn):
+        cue_list = random_cues(20_000)
+        source_id = core._find_or_create_source(db_conn, "WEBVTT\n\nx", cue_list)
+        max_span = db_conn.execute(
+            "SELECT max_cue_ms FROM source WHERE id = ?", (source_id,)
+        ).fetchone()[0]
+        horizon = cue_list[-1].end_ms
+        cut_list = cuts(
+            [(f"F{i:04d}", start, start + 60_000) for i, start in enumerate(range(0, horizon - 60_000, 60_000))]
+        )
+        assert len(cut_list) >= 1000
+
+        fetched = []
+        original = core._overlapping_cues
+
+        def spy(conn, source_id, seg_start, seg_end, span):
+            found = original(conn, source_id, seg_start, seg_end, span)
+            fetched.append(len(found))
+            return found
+
+        core._overlapping_cues = spy
+        try:
+            frags = core.compute_occurrences_indexed(
+                db_conn, source_id, cut_list, max_span
+            )
+        finally:
+            core._overlapping_cues = original
+        assert len(fetched) == len(cut_list)
+        # 每个选段只取相交的字幕：总读取量与出现数同阶，而非 选段数×全部字幕
+        assert sum(fetched) == len(core.flatten(frags))
+        assert sum(fetched) < len(cue_list) * len(cut_list) // 100
+
+    def test_query_plan_uses_start_index(self, db_conn):
+        core._find_or_create_source(db_conn, "WEBVTT\n\nx", random_cues(100))
+        plan = db_conn.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT cue_index, start_ms, end_ms, text FROM source_cue
+            WHERE source_id = 1 AND start_ms > 0 AND start_ms < 10 AND end_ms > 5
+            """
+        ).fetchall()
+        detail = " ".join(" ".join(map(str, row)) for row in plan)
+        assert "idx_source_cue_start" in detail
+
+
+class TestSourceStore:
+    def test_same_content_reuses_source_and_index(self, db_conn):
+        cue_list = cues([(0, 1000, "甲"), (1000, 2000, "乙")])
+        first = core._find_or_create_source(db_conn, "WEBVTT\n\nx", cue_list, "a.vtt")
+        second = core._find_or_create_source(db_conn, "WEBVTT\n\nx", cue_list, "b.vtt")
+        assert first == second
+        rows = db_conn.execute("SELECT COUNT(*) AS c FROM source").fetchone()
+        assert rows["c"] == 1
+        indexed = db_conn.execute(
+            "SELECT COUNT(*) AS c FROM source_cue WHERE source_id = ?", (first,)
+        ).fetchone()
+        assert indexed["c"] == 2
+
+    def test_different_content_separate_sources(self, db_conn):
+        first = core._find_or_create_source(
+            db_conn, "WEBVTT\n\nx", cues([(0, 1000, "甲")])
+        )
+        second = core._find_or_create_source(
+            db_conn, "WEBVTT\n\ny", cues([(0, 1000, "乙")])
+        )
+        assert first != second
+
+    def test_create_draft_shares_source_across_drafts(self, db_conn):
+        vtt = "WEBVTT\n\n1\n00:00:00.000 --> 00:00:02.000\n甲\n"
+        parsed = core.parse_vtt(vtt)
+        cut_list = cuts([("A", 0, 2000)])
+        first = core.create_draft(db_conn, cut_list, vtt_raw=vtt, cues=parsed)
+        source_id = core.load_draft(db_conn, first)["source_id"]
+        assert source_id is not None
+        second = core.create_draft(
+            db_conn, cuts([("B", 0, 1000)]), source_id=source_id
+        )
+        rows = db_conn.execute(
+            "SELECT id, source_id, vtt_raw FROM draft ORDER BY id"
+        ).fetchall()
+        assert [row["source_id"] for row in rows] == [source_id, source_id]
+        assert all(row["vtt_raw"] == "" for row in rows)
+        # 索引只有一份
+        count = db_conn.execute("SELECT COUNT(*) AS c FROM source_cue").fetchone()
+        assert count["c"] == 1
+        bundle = core.load_bundle(db_conn, second)
+        assert bundle["cue_count"] == 1
+        assert core.flatten(bundle["fragments"])[0].text == "甲"
+
+    def test_failed_create_rolls_back_source_and_index(self, db_conn, monkeypatch):
+        vtt = "WEBVTT\n\n1\n00:00:00.000 --> 00:00:02.000\n甲\n"
+        parsed = core.parse_vtt(vtt)
+
+        def boom(*_args):
+            raise RuntimeError("写入失败")
+
+        monkeypatch.setattr(core, "_insert_decisions", boom)
+        with pytest.raises(RuntimeError):
+            core.create_draft(
+                db_conn, cuts([("A", 0, 2000)]), vtt_raw=vtt, cues=parsed
+            )
+        assert db_conn.execute("SELECT COUNT(*) FROM draft").fetchone()[0] == 0
+        assert db_conn.execute("SELECT COUNT(*) FROM source").fetchone()[0] == 0
+        assert db_conn.execute("SELECT COUNT(*) FROM source_cue").fetchone()[0] == 0
+        assert core.lock_version(db_conn) == 0
+
+    def test_missing_source_rejected_without_side_effects(self, db_conn):
+        with pytest.raises(core.SourceNotFound):
+            core.create_draft(db_conn, cuts([("A", 0, 1000)]), source_id=999)
+        assert db_conn.execute("SELECT COUNT(*) FROM draft").fetchone()[0] == 0
