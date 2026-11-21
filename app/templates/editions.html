@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}发布存档 · 口述史馆{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>发布存档</h1>
+  {% if editions %}
+  <table>
+    <thead><tr><th>版号</th><th>发布时间</th><th>字幕条数</th><th>总时长</th><th>SHA-256</th><th></th></tr></thead>
+    <tbody>
+      {% for edition in editions %}
+      <tr>
+        <td>第 {{ edition.version_no }} 版</td>
+        <td>{{ edition.published_at }}</td>
+        <td>{{ edition.cue_count }}</td>
+        <td>{{ edition.total_ms | ts }}</td>
+        <td class="mono">{{ edition.vtt_sha256[:16] }}…</td>
+        <td><a href="{{ url_for('edition_detail', version_no=edition.version_no) }}">查看</a> ·
+            <a href="{{ url_for('download', version_no=edition.version_no) }}">下载 WebVTT</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="hint">尚无已发布版本。</p>
+  {% endif %}
+</section>
+{% endblock %}

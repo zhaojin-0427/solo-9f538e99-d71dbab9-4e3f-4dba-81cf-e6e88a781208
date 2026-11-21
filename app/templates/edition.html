@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}第 {{ edition.version_no }} 版 · 口述史馆{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>第 {{ edition.version_no }} 版</h1>
+  <dl class="facts">
+    <div><dt>发布时间</dt><dd>{{ edition.published_at }}</dd></div>
+    <div><dt>字幕条数</dt><dd>{{ edition.cue_count }}</dd></div>
+    <div><dt>总时长</dt><dd>{{ edition.total_ms | ts }}</dd></div>
+  </dl>
+  <p class="hint mono">SHA-256 {{ edition.vtt_sha256 }}</p>
+  <p><a class="button primary" href="{{ url_for('download', version_no=edition.version_no) }}">下载完整 WebVTT</a></p>
+</section>
+<section class="panel">
+  <h2>文件内容</h2>
+  <pre class="vtt">{{ body }}</pre>
+</section>
+{% endblock %}

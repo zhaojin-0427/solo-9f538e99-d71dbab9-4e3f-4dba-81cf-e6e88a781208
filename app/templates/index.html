@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}口述史馆 · 检索字幕{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>口述史馆 · 检索字幕</h1>
+  <p class="lede">上传单期原片的 WebVTT 与剪辑 CSV，按行序拼接片段，逐次校订被剪口截断的字幕，发布后按版号下载完整 WebVTT。</p>
+</section>
+
+<section class="panel">
+  <h2>上传单期原片</h2>
+  <form method="post" action="{{ url_for('upload') }}" enctype="multipart/form-data" class="upload-form">
+    <label>
+      <span>原片 WebVTT</span>
+      <input type="file" name="vtt" accept=".vtt,text/vtt" required>
+    </label>
+    <label>
+      <span>剪辑 CSV</span>
+      <input type="file" name="csv" accept=".csv,text/csv" required>
+    </label>
+    <p class="hint">CSV 每行：片段号、原片起毫秒、原片止毫秒；行序即拼接顺序，同一时段可被多个片段号重复取用。</p>
+    <button type="submit" class="primary">建立草稿</button>
+  </form>
+</section>
+
+{% if draft %}
+<section class="panel">
+  <h2>当前草稿</h2>
+  <dl class="facts">
+    <div><dt>片段</dt><dd>{{ draft.fragment_count }}</dd></div>
+    <div><dt>出现</dt><dd>{{ draft.occurrence_count }}</dd></div>
+    <div><dt>剪口字幕</dt><dd>{{ draft.cut_count }}</dd></div>
+    <div><dt>待处理</dt><dd class="{{ 'warn' if draft.pending_count else 'ok' }}">{{ draft.pending_count }}</dd></div>
+    <div><dt>节选总长</dt><dd>{{ draft.total_ms | ts }}</dd></div>
+  </dl>
+  <p class="hint">{{ draft.vtt_filename }} · {{ draft.csv_filename }} · 版本锁 {{ draft.revision }}</p>
+  <p><a class="button" href="{{ url_for('draft_page', draft_id=draft.id) }}">继续校订</a></p>
+</section>
+{% endif %}
+
+<section class="panel">
+  <h2>已发布版本</h2>
+  {% if editions %}
+  <table>
+    <thead><tr><th>版号</th><th>发布时间</th><th>字幕条数</th><th>总时长</th><th></th></tr></thead>
+    <tbody>
+      {% for edition in editions %}
+      <tr>
+        <td>第 {{ edition.version_no }} 版</td>
+        <td>{{ edition.published_at }}</td>
+        <td>{{ edition.cue_count }}</td>
+        <td>{{ edition.total_ms | ts }}</td>
+        <td><a href="{{ url_for('edition_detail', version_no=edition.version_no) }}">查看</a> ·
+            <a href="{{ url_for('download', version_no=edition.version_no) }}">下载 WebVTT</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="hint">尚无已发布版本。</p>
+  {% endif %}
+</section>
+{% endblock %}

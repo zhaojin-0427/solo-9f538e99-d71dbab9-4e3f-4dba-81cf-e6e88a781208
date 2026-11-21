@@ -1,0 +1,15 @@
+services:
+  oral-history:
+    build: .
+    image: oral-history-subtitles:local
+    ports:
+      - "8000:8000"
+    environment:
+      ORAL_HISTORY_DB: /data/oral_history.db
+      ORAL_HISTORY_SECRET: ${ORAL_HISTORY_SECRET:-oral-history-local}
+    volumes:
+      - oral-history-data:/data
+    restart: unless-stopped
+
+volumes:
+  oral-history-data:
